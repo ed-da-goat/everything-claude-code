@@ -76,9 +76,15 @@ process.stdin.on('end', () => {
 
     const sessionId = String(input.session_id || process.env.CLAUDE_SESSION_ID || 'default');
 
-    // Parse transcript JSONL for per-message usage data
+    // First try: stdin usage fields (for direct API or test scenarios)
+    const stdinUsage = input.usage || input.token_usage || {};
+    inputTokens = toNumber(stdinUsage.input_tokens || stdinUsage.prompt_tokens || 0);
+    outputTokens = toNumber(stdinUsage.output_tokens || stdinUsage.completion_tokens || 0);
+    if (input.model) model = String(input.model);
+
+    // Fallback: parse transcript JSONL for per-message usage data
     const transcriptPath = input.transcript_path;
-    if (transcriptPath && fs.existsSync(transcriptPath)) {
+    if (inputTokens === 0 && outputTokens === 0 && transcriptPath && fs.existsSync(transcriptPath)) {
       try {
         const lines = fs.readFileSync(transcriptPath, 'utf8').split('\n').filter(Boolean);
         for (const line of lines) {

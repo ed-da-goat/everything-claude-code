@@ -68,27 +68,41 @@ process.stdin.on('end', () => {
       }
     } catch { /* debug logging is best-effort */ }
 
-    const usage = input.usage || input.token_usage || {};
-    let inputTokens = toNumber(usage.input_tokens || usage.prompt_tokens || 0);
-    let outputTokens = toNumber(usage.output_tokens || usage.completion_tokens || 0);
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let cacheReadTokens = 0;
+    let cacheCreateTokens = 0;
+    let model = 'unknown';
 
-    // Fallback: read from stats-cache.json if stdin has no token data
-    if (inputTokens === 0 && outputTokens === 0) {
+    const sessionId = String(input.session_id || process.env.CLAUDE_SESSION_ID || 'default');
+
+    // Parse transcript JSONL for per-message usage data
+    const transcriptPath = input.transcript_path;
+    if (transcriptPath && fs.existsSync(transcriptPath)) {
       try {
-        const statsPath = path.join(getClaudeDir(), 'stats-cache.json');
-        if (fs.existsSync(statsPath)) {
-          const stats = JSON.parse(fs.readFileSync(statsPath, 'utf8'));
-          const modelUsage = stats.modelUsage || {};
-          for (const [, usage] of Object.entries(modelUsage)) {
-            inputTokens += toNumber(usage.inputTokens) + toNumber(usage.cacheReadInputTokens) + toNumber(usage.cacheCreationInputTokens);
-            outputTokens += toNumber(usage.outputTokens);
-          }
+        const lines = fs.readFileSync(transcriptPath, 'utf8').split('\n').filter(Boolean);
+        for (const line of lines) {
+          try {
+            const entry = JSON.parse(line);
+            if (entry.type === 'assistant' && entry.message?.usage) {
+              const u = entry.message.usage;
+              inputTokens += toNumber(u.input_tokens);
+              outputTokens += toNumber(u.output_tokens);
+              cacheReadTokens += toNumber(u.cache_read_input_tokens);
+              cacheCreateTokens += toNumber(u.cache_creation_input_tokens);
+              if (entry.message.model) model = entry.message.model;
+            }
+          } catch { /* skip unparseable lines */ }
         }
-      } catch { /* fallback is best-effort */ }
+      } catch { /* transcript read is best-effort */ }
     }
 
-    const model = String(input.model || input._cursor?.model || process.env.CLAUDE_MODEL || 'unknown');
-    const sessionId = String(process.env.CLAUDE_SESSION_ID || 'default');
+    if (model === 'unknown') {
+      model = String(process.env.CLAUDE_MODEL || 'unknown');
+    }
+
+    // Include cache tokens in total for cost estimation
+    const totalInput = inputTokens + cacheReadTokens + cacheCreateTokens;
 
     const row = {
       timestamp: new Date().toISOString(),
@@ -96,7 +110,9 @@ process.stdin.on('end', () => {
       model,
       input_tokens: inputTokens,
       output_tokens: outputTokens,
-      estimated_cost_usd: estimateCost(model, inputTokens, outputTokens),
+      cache_read_tokens: cacheReadTokens,
+      cache_create_tokens: cacheCreateTokens,
+      estimated_cost_usd: estimateCost(model, totalInput, outputTokens),
     };
 
     appendFile(path.join(metricsDir, 'costs.jsonl'), `${JSON.stringify(row)}\n`);

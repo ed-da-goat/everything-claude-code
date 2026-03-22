@@ -76,6 +76,43 @@ async function main() {
     log(getSelectionPrompt());
   }
 
+  // Load project instincts into context (#plan-5)
+  try {
+    const homunculus = path.join(os.homedir(), '.claude', 'homunculus');
+    const registryPath = path.join(homunculus, 'projects.json');
+    if (fs.existsSync(registryPath)) {
+      const registry = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
+      const cwd = process.cwd();
+      // Find matching project by root path
+      const match = Object.values(registry).find(p => cwd.startsWith(p.root));
+      if (match) {
+        const instinctsDir = path.join(homunculus, 'projects', match.id, 'instincts', 'personal');
+        if (fs.existsSync(instinctsDir)) {
+          const instinctFiles = fs.readdirSync(instinctsDir).filter(f => f.endsWith('.md'));
+          if (instinctFiles.length > 0) {
+            const instincts = instinctFiles.slice(0, 10).map(f => {
+              const content = fs.readFileSync(path.join(instinctsDir, f), 'utf8');
+              // Extract id and action from frontmatter and body
+              const idMatch = content.match(/^id:\s*(.+)$/m);
+              const actionMatch = content.match(/## Action\s*\n(.+)/);
+              const triggerMatch = content.match(/^trigger:\s*(.+)$/m);
+              if (idMatch && actionMatch) {
+                return `- ${triggerMatch ? triggerMatch[1] : idMatch[1]}: ${actionMatch[1].trim()}`;
+              }
+              return null;
+            }).filter(Boolean);
+            if (instincts.length > 0) {
+              output(`Project instincts (${match.name}):\n${instincts.join('\n')}`);
+              log(`[SessionStart] Loaded ${instincts.length} instinct(s) for ${match.name}`);
+            }
+          }
+        }
+      }
+    }
+  } catch (err) {
+    log(`[SessionStart] Instinct loading skipped: ${err.message}`);
+  }
+
   // Auto-start instinct observer if observations exceed threshold (#plan-1)
   try {
     const homunculus = path.join(os.homedir(), '.claude', 'homunculus', 'projects');

@@ -209,6 +209,37 @@ async function main() {
     }
   }
 
+  // Fallback: create metadata-based summary when no transcript was provided
+  // (don't override when transcript exists but had no user messages)
+  if (!summary && !transcriptPath) {
+    const cwd = process.cwd();
+    const sessionId = process.env.CLAUDE_SESSION_ID || 'unknown';
+    const gitBranch = (() => {
+      try {
+        return require('child_process')
+          .execSync('git rev-parse --abbrev-ref HEAD', { cwd, stdio: ['pipe', 'pipe', 'pipe'] })
+          .toString().trim();
+      } catch { return null; }
+    })();
+    const gitRepoName = (() => {
+      try {
+        const root = require('child_process')
+          .execSync('git rev-parse --show-toplevel', { cwd, stdio: ['pipe', 'pipe', 'pipe'] })
+          .toString().trim();
+        return path.basename(root);
+      } catch { return path.basename(cwd); }
+    })();
+
+    summary = {
+      userMessages: [`Session in ${gitRepoName}${gitBranch ? ` (branch: ${gitBranch})` : ''}`],
+      toolsUsed: [],
+      filesModified: [],
+      totalMessages: 0,
+      metadata: { cwd, sessionId, gitBranch, gitRepoName }
+    };
+    log(`[SessionEnd] No transcript available, using metadata fallback`);
+  }
+
   if (fs.existsSync(sessionFile)) {
     const existing = readFile(sessionFile);
     let updatedContent = existing;

@@ -9,6 +9,9 @@
  * sessions and learned skills.
  */
 
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 const {
   getSessionsDir,
   getLearnedSkillsDir,
@@ -71,6 +74,28 @@ async function main() {
   if (pm.source === 'default') {
     log('[SessionStart] No package manager preference found.');
     log(getSelectionPrompt());
+  }
+
+  // Auto-start instinct observer if observations exceed threshold (#plan-1)
+  try {
+    const homunculus = path.join(os.homedir(), '.claude', 'homunculus', 'projects');
+    if (fs.existsSync(homunculus)) {
+      const projectDirs = fs.readdirSync(homunculus, { withFileTypes: true })
+        .filter(d => d.isDirectory());
+      for (const dir of projectDirs) {
+        const projPath = path.join(homunculus, dir.name);
+        const obsFile = path.join(projPath, 'observations.jsonl');
+        const pidFile = path.join(projPath, '.observer.pid');
+        if (fs.existsSync(obsFile) && !fs.existsSync(pidFile)) {
+          const lineCount = fs.readFileSync(obsFile, 'utf8').split('\n').filter(Boolean).length;
+          if (lineCount >= 50) {
+            log(`[SessionStart] ${lineCount} unprocessed observations in ${dir.name}, consider running: bash ~/.claude/skills/continuous-learning-v2/agents/start-observer.sh`);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    log(`[SessionStart] Observer check skipped: ${err.message}`);
   }
 
   // Detect project type and frameworks (#293)

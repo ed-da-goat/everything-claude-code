@@ -48,17 +48,47 @@ process.stdin.on('data', chunk => {
 });
 
 process.stdin.on('end', () => {
+  const fs = require('fs');
+  const metricsDir = path.join(getClaudeDir(), 'metrics');
+  ensureDir(metricsDir);
+
   try {
     const input = raw.trim() ? JSON.parse(raw) : {};
+
+    // Debug: log raw stdin keys on first few runs
+    const debugPath = path.join(metricsDir, 'cost-debug.log');
+    try {
+      const debugLines = fs.existsSync(debugPath)
+        ? fs.readFileSync(debugPath, 'utf8').split('\n').filter(Boolean).length
+        : 0;
+      if (debugLines < 5) {
+        const keys = Object.keys(input).join(', ');
+        fs.appendFileSync(debugPath, `[${new Date().toISOString()}] stdin keys: ${keys}\n`);
+        fs.appendFileSync(debugPath, `[${new Date().toISOString()}] raw (200 chars): ${raw.slice(0, 200)}\n`);
+      }
+    } catch { /* debug logging is best-effort */ }
+
     const usage = input.usage || input.token_usage || {};
-    const inputTokens = toNumber(usage.input_tokens || usage.prompt_tokens || 0);
-    const outputTokens = toNumber(usage.output_tokens || usage.completion_tokens || 0);
+    let inputTokens = toNumber(usage.input_tokens || usage.prompt_tokens || 0);
+    let outputTokens = toNumber(usage.output_tokens || usage.completion_tokens || 0);
+
+    // Fallback: read from stats-cache.json if stdin has no token data
+    if (inputTokens === 0 && outputTokens === 0) {
+      try {
+        const statsPath = path.join(getClaudeDir(), 'stats-cache.json');
+        if (fs.existsSync(statsPath)) {
+          const stats = JSON.parse(fs.readFileSync(statsPath, 'utf8'));
+          const modelUsage = stats.modelUsage || {};
+          for (const [, usage] of Object.entries(modelUsage)) {
+            inputTokens += toNumber(usage.inputTokens) + toNumber(usage.cacheReadInputTokens) + toNumber(usage.cacheCreationInputTokens);
+            outputTokens += toNumber(usage.outputTokens);
+          }
+        }
+      } catch { /* fallback is best-effort */ }
+    }
 
     const model = String(input.model || input._cursor?.model || process.env.CLAUDE_MODEL || 'unknown');
     const sessionId = String(process.env.CLAUDE_SESSION_ID || 'default');
-
-    const metricsDir = path.join(getClaudeDir(), 'metrics');
-    ensureDir(metricsDir);
 
     const row = {
       timestamp: new Date().toISOString(),

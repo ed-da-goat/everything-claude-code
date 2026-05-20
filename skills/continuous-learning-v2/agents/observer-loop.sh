@@ -12,8 +12,17 @@ SLEEP_PID=""
 USR1_FIRED=0
 ANALYZING=0
 LAST_ANALYSIS_EPOCH=0
+CONSECUTIVE_FAILURES=0
+MAX_FAILURES=3
+BACKOFF_BASE=60
 # Minimum seconds between analyses (prevents rapid re-triggering)
 ANALYSIS_COOLDOWN="${ECC_OBSERVER_ANALYSIS_COOLDOWN:-60}"
+# Idle self-termination: exit after this many consecutive cycles with no new
+# observations, so the loop does not survive as an orphan past its session.
+# observe.sh lazy-restarts the observer when tool activity resumes.
+MAX_IDLE_CYCLES="${ECC_OBSERVER_MAX_IDLE_CYCLES:-4}"
+IDLE_CYCLES=0
+LAST_OBS_COUNT=-1
 
 cleanup() {
   [ -n "$SLEEP_PID" ] && kill "$SLEEP_PID" 2>/dev/null
@@ -30,7 +39,9 @@ analyze_observations() {
   fi
 
   obs_count=$(wc -l < "$OBSERVATIONS_FILE" 2>/dev/null || echo 0)
-  if [ "$obs_count" -lt "$MIN_OBSERVATIONS" ]; then
+  last_analyzed=$(cat "${PROJECT_DIR}/.last-analyzed-line" 2>/dev/null || echo 0)
+  new_count=$((obs_count - last_analyzed))
+  if [ "$new_count" -lt "$MIN_OBSERVATIONS" ]; then
     return
   fi
 
@@ -52,13 +63,12 @@ analyze_observations() {
     return
   fi
 
-  # Sample recent observations instead of loading the entire file (#521).
-  # This prevents multi-MB payloads from being passed to the LLM.
-  MAX_ANALYSIS_LINES="${ECC_OBSERVER_MAX_ANALYSIS_LINES:-500}"
+  # Sample new (unanalyzed) observations, capped to prevent multi-MB payloads (#521).
+  MAX_ANALYSIS_LINES="${ECC_OBSERVER_MAX_ANALYSIS_LINES:-40}"
   analysis_file="$(mktemp "${TMPDIR:-/tmp}/ecc-observer-analysis.XXXXXX.jsonl")"
-  tail -n "$MAX_ANALYSIS_LINES" "$OBSERVATIONS_FILE" > "$analysis_file"
+  tail -n "$new_count" "$OBSERVATIONS_FILE" | tail -n "$MAX_ANALYSIS_LINES" > "$analysis_file"
   analysis_count=$(wc -l < "$analysis_file" 2>/dev/null || echo 0)
-  echo "[$(date)] Using last $analysis_count of $obs_count observations for analysis" >> "$LOG_FILE"
+  echo "[$(date)] Analyzing $analysis_count new observations ($new_count since last run, $obs_count total)" >> "$LOG_FILE"
 
   prompt_file="$(mktemp "${TMPDIR:-/tmp}/ecc-observer-prompt.XXXXXX")"
   cat > "$prompt_file" <<PROMPT
@@ -99,6 +109,36 @@ Rules:
 - Examples of project patterns: use React functional components, follow Django REST framework conventions
 PROMPT
 
+  # Daily cost guard: cap analyses per day
+  MAX_DAILY_ANALYSES="${ECC_OBSERVER_MAX_DAILY:-60}"
+  today=$(date +%Y-%m-%d)
+  counter_file="${PROJECT_DIR}/.observer-daily-count"
+  daily_count=0
+  if [ -f "$counter_file" ] && [ "$(head -1 "$counter_file" 2>/dev/null)" = "$today" ]; then
+    daily_count=$(tail -1 "$counter_file" 2>/dev/null || echo 0)
+  fi
+  if [ "$daily_count" -ge "$MAX_DAILY_ANALYSES" ]; then
+    echo "[$(date)] Daily analysis limit ($MAX_DAILY_ANALYSES) reached, skipping" >> "$LOG_FILE"
+    rm -f "$prompt_file" "$analysis_file"
+    return
+  fi
+
+  # Run error detector for pre-analysis (if available)
+  error_report=""
+  error_detector="${SKILL_ROOT}/scripts/error-detector.py"
+  if [ -f "$error_detector" ]; then
+    error_report=$("${PYTHON_CMD:-python3}" "$error_detector" "$analysis_file" 2>/dev/null || true)
+  fi
+  if [ -n "$error_report" ]; then
+    cat >> "$prompt_file" <<ERROR_SECTION
+
+## Pre-detected Repeat Error Patterns (HIGH PRIORITY)
+These errors appeared 3+ times. Create instincts for them FIRST:
+
+$error_report
+ERROR_SECTION
+  fi
+
   timeout_seconds="${ECC_OBSERVER_TIMEOUT_SECONDS:-120}"
   max_turns="${ECC_OBSERVER_MAX_TURNS:-10}"
   exit_code=0
@@ -134,14 +174,29 @@ PROMPT
   rm -f "$prompt_file" "$analysis_file"
 
   if [ "$exit_code" -ne 0 ]; then
-    echo "[$(date)] Claude analysis failed (exit $exit_code)" >> "$LOG_FILE"
+    CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
+    echo "[$(date)] Analysis failed (exit $exit_code, $CONSECUTIVE_FAILURES/$MAX_FAILURES)" >> "$LOG_FILE"
+    if [ "$CONSECUTIVE_FAILURES" -ge "$MAX_FAILURES" ]; then
+      echo "[$(date)] FATAL: $MAX_FAILURES consecutive failures, observer stopping" >> "$LOG_FILE"
+      cleanup
+      exit 1
+    fi
+    backoff=$((BACKOFF_BASE * (2 ** (CONSECUTIVE_FAILURES - 1))))
+    echo "[$(date)] Backing off ${backoff}s before next attempt" >> "$LOG_FILE"
+    sleep "$backoff" &
+    SLEEP_PID=$!
+    wait "$SLEEP_PID" 2>/dev/null || true
+    SLEEP_PID=""
+    return
+  else
+    CONSECUTIVE_FAILURES=0
   fi
 
-  if [ -f "$OBSERVATIONS_FILE" ]; then
-    archive_dir="${PROJECT_DIR}/observations.archive"
-    mkdir -p "$archive_dir"
-    mv "$OBSERVATIONS_FILE" "$archive_dir/processed-$(date +%Y%m%d-%H%M%S)-$$.jsonl" 2>/dev/null || true
-  fi
+  # Mark how far we've analyzed (don't delete observations — they accumulate for richer analysis)
+  echo "$obs_count" > "${PROJECT_DIR}/.last-analyzed-line"
+
+  # Update daily analysis counter
+  printf '%s\n%s\n' "$today" "$((daily_count + 1))" > "$counter_file"
 }
 
 on_usr1() {
@@ -174,7 +229,7 @@ echo "$$" > "$PID_FILE"
 echo "[$(date)] Observer started for ${PROJECT_NAME} (PID: $$)" >> "$LOG_FILE"
 
 while true; do
-  sleep "$OBSERVER_INTERVAL_SECONDS" &
+  sleep "${OBSERVER_INTERVAL_SECONDS:-900}" &
   SLEEP_PID=$!
   wait "$SLEEP_PID" 2>/dev/null
   SLEEP_PID=""
@@ -184,4 +239,19 @@ while true; do
   else
     analyze_observations
   fi
+
+  # Idle self-termination: if the observation count has not moved for
+  # MAX_IDLE_CYCLES cycles, the session is over — exit cleanly instead of
+  # lingering as an orphan. observe.sh re-spawns us on the next tool call.
+  cur_obs_count=$(wc -l < "$OBSERVATIONS_FILE" 2>/dev/null || echo 0)
+  if [ "$cur_obs_count" = "$LAST_OBS_COUNT" ]; then
+    IDLE_CYCLES=$((IDLE_CYCLES + 1))
+    if [ "$IDLE_CYCLES" -ge "$MAX_IDLE_CYCLES" ]; then
+      echo "[$(date)] Observer idle ${IDLE_CYCLES} cycles, exiting (lazy-restart on next activity)" >> "$LOG_FILE"
+      cleanup
+    fi
+  else
+    IDLE_CYCLES=0
+  fi
+  LAST_OBS_COUNT="$cur_obs_count"
 done

@@ -75,6 +75,13 @@ analyze_observations() {
 Read ${analysis_file} and identify patterns for the project ${PROJECT_NAME} (user corrections, error resolutions, repeated workflows, tool preferences).
 If you find 3+ occurrences of the same pattern, create an instinct file in ${INSTINCTS_DIR}/<id>.md.
 
+CRITICAL EXECUTION RULES:
+- You are a non-interactive background agent. There is NO user to grant permission.
+- Write is in your allowedTools — call the Write tool directly to create instinct files.
+- DO NOT ask for permission, DO NOT describe what you would write, DO NOT propose changes.
+- Just call Write for each instinct file. The directory ${INSTINCTS_DIR} already exists.
+- If you finish writing all instincts before max_turns, output one line: "DONE: <N> instincts written" and stop.
+
 CRITICAL: Every instinct file MUST use this exact format:
 
 ---
@@ -140,17 +147,17 @@ ERROR_SECTION
   fi
 
   timeout_seconds="${ECC_OBSERVER_TIMEOUT_SECONDS:-120}"
-  max_turns="${ECC_OBSERVER_MAX_TURNS:-10}"
+  max_turns="${ECC_OBSERVER_MAX_TURNS:-20}"
   exit_code=0
 
   case "$max_turns" in
     ''|*[!0-9]*)
-      max_turns=10
+      max_turns=20
       ;;
   esac
 
   if [ "$max_turns" -lt 4 ]; then
-    max_turns=10
+    max_turns=20
   fi
 
   # Prevent observe.sh from recording this automated Haiku session as observations

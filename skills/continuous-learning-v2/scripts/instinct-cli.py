@@ -721,7 +721,7 @@ def cmd_evolve(args) -> int:
         for inst in workflow_instincts[:5]:
             trigger = inst.get('trigger', 'unknown')
             cmd_name = trigger.replace('when ', '').replace('implementing ', '').replace('a ', '')
-            cmd_name = cmd_name.replace(' ', '-')[:20]
+            cmd_name = cmd_name.replace(' ', '-')[:40]
             print(f"  /{cmd_name}")
             print(f"    From: {inst.get('id')} [{inst.get('scope', '?')}]")
             print(f"    Confidence: {inst.get('confidence', 0.5):.0%}")
@@ -1009,14 +1009,52 @@ def cmd_projects(args) -> int:
 # Generate Evolved Structures
 # ─────────────────────────────────────────────
 
+def _evolved_instinct_ids(evolved_dir: Path) -> set:
+    """Collect instinct ids already materialized anywhere under evolved_dir.
+
+    Makes `_generate_evolved` idempotent: an instinct that already has an
+    evolved file (under any name, including human-renamed ones) is skipped on
+    re-run instead of being re-emitted under a fresh auto-slug. Scans for three
+    markers so all generations of files are recognized:
+      - frontmatter `source_instinct: <id>`        (curated/clean files)
+      - body line  `Evolved from instinct: <id>`   (legacy generated files)
+      - marker     `<!-- evolved-from: id1,id2 -->` (current generated files)
+    """
+    ids = set()
+    if not evolved_dir.exists():
+        return ids
+    for file in evolved_dir.rglob('*.md'):
+        try:
+            text = file.read_text(encoding='utf-8')
+        except Exception:
+            continue
+        for m in re.finditer(r'^\s*source_instinct:\s*(.+)$', text, re.MULTILINE):
+            ids.add(m.group(1).strip().strip('"').strip("'"))
+        for m in re.finditer(r'Evolved from instinct:\s*(.+?)\s*$', text, re.MULTILINE):
+            ids.add(m.group(1).strip())
+        for m in re.finditer(r'<!--\s*evolved-from:\s*(.+?)\s*-->', text):
+            ids.update(p.strip() for p in m.group(1).split(',') if p.strip())
+    return ids
+
+
 def _generate_evolved(skill_candidates: list, workflow_instincts: list, agent_candidates: list, evolved_dir: Path) -> list[str]:
-    """Generate skill/command/agent files from analyzed instinct clusters."""
+    """Generate skill/command/agent files from analyzed instinct clusters.
+
+    Idempotent: instincts already materialized under evolved_dir are skipped, so
+    re-running never duplicates an existing file. Output filenames derive from
+    the instinct id (not the trigger string) so any net-new file overwrites
+    cleanly on a subsequent run.
+    """
     generated = []
+    existing_ids = _evolved_instinct_ids(evolved_dir)
 
     # Generate skills from top candidates
     for cand in skill_candidates[:5]:
         trigger = cand['trigger'].strip()
         if not trigger:
+            continue
+        cluster_ids = [i.get('id', '') for i in cand['instincts'] if i.get('id')]
+        if cluster_ids and all(cid in existing_ids for cid in cluster_ids):
             continue
         name = re.sub(r'[^a-z0-9]+', '-', trigger.lower()).strip('-')[:30]
         if not name:
@@ -1026,6 +1064,7 @@ def _generate_evolved(skill_candidates: list, workflow_instincts: list, agent_ca
         skill_dir.mkdir(parents=True, exist_ok=True)
 
         content = f"# {name}\n\n"
+        content += f"<!-- evolved-from: {','.join(cluster_ids)} -->\n"
         content += f"Evolved from {len(cand['instincts'])} instincts "
         content += f"(avg confidence: {cand['avg_confidence']:.0%})\n\n"
         content += f"## When to Apply\n\n"
@@ -1038,38 +1077,49 @@ def _generate_evolved(skill_candidates: list, workflow_instincts: list, agent_ca
             content += f"- {action}\n"
 
         (skill_dir / "SKILL.md").write_text(content)
+        existing_ids.update(cluster_ids)
         generated.append(str(skill_dir / "SKILL.md"))
 
     # Generate commands from workflow instincts
     for inst in workflow_instincts[:5]:
-        trigger = inst.get('trigger', 'unknown')
-        cmd_name = re.sub(r'[^a-z0-9]+', '-', trigger.lower().replace('when ', '').replace('implementing ', ''))
-        cmd_name = cmd_name.strip('-')[:20]
+        inst_id = inst.get('id', '')
+        if not inst_id or inst_id in existing_ids:
+            continue
+        # Name from the instinct id (deterministic), not the trigger string.
+        cmd_name = re.sub(r'[^a-z0-9]+', '-', inst_id.lower()).strip('-')[:40]
         if not cmd_name:
             continue
 
         cmd_file = evolved_dir / "commands" / f"{cmd_name}.md"
-        content = f"# {cmd_name}\n\n"
-        content += f"Evolved from instinct: {inst.get('id', 'unnamed')}\n"
+        cmd_file.parent.mkdir(parents=True, exist_ok=True)
+        content = f"# /{cmd_name}\n\n"
+        content += f"<!-- evolved-from: {inst_id} -->\n"
+        content += f"Evolved from instinct: {inst_id}\n"
         content += f"Confidence: {inst.get('confidence', 0.5):.0%}\n\n"
         content += inst.get('content', '')
 
         cmd_file.write_text(content)
+        existing_ids.add(inst_id)
         generated.append(str(cmd_file))
 
     # Generate agents from complex clusters
     for cand in agent_candidates[:3]:
         trigger = cand['trigger'].strip()
+        instinct_ids = [i.get('id', 'unnamed') for i in cand['instincts']]
+        covered_ids = [iid for iid in instinct_ids if iid != 'unnamed']
+        if covered_ids and all(iid in existing_ids for iid in covered_ids):
+            continue
         agent_name = re.sub(r'[^a-z0-9]+', '-', trigger.lower()).strip('-')[:20]
         if not agent_name:
             continue
 
         agent_file = evolved_dir / "agents" / f"{agent_name}.md"
+        agent_file.parent.mkdir(parents=True, exist_ok=True)
         domains = ', '.join(cand['domains'])
-        instinct_ids = [i.get('id', 'unnamed') for i in cand['instincts']]
 
         content = f"---\nmodel: sonnet\ntools: Read, Grep, Glob\n---\n"
         content += f"# {agent_name}\n\n"
+        content += f"<!-- evolved-from: {','.join(covered_ids)} -->\n"
         content += f"Evolved from {len(cand['instincts'])} instincts "
         content += f"(avg confidence: {cand['avg_confidence']:.0%})\n"
         content += f"Domains: {domains}\n\n"
@@ -1078,6 +1128,7 @@ def _generate_evolved(skill_candidates: list, workflow_instincts: list, agent_ca
             content += f"- {iid}\n"
 
         agent_file.write_text(content)
+        existing_ids.update(covered_ids)
         generated.append(str(agent_file))
 
     return generated

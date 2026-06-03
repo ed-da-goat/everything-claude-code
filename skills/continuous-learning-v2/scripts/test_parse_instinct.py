@@ -45,6 +45,8 @@ _find_cross_project_instincts = _mod._find_cross_project_instincts
 load_registry = _mod.load_registry
 _validate_instinct_id = _mod._validate_instinct_id
 _update_registry = _mod._update_registry
+_generate_evolved = _mod._generate_evolved
+_evolved_instinct_ids = _mod._evolved_instinct_ids
 
 
 # ─────────────────────────────────────────────
@@ -982,3 +984,78 @@ def test_update_registry_atomic_replaces_file(patch_globals):
     assert "abc123" in data
     leftovers = list(tree["registry_file"].parent.glob(".projects.json.tmp.*"))
     assert leftovers == []
+
+
+# ─────────────────────────────────────────────
+# _generate_evolved — idempotency (no duplicate files on re-run)
+# ─────────────────────────────────────────────
+
+def _evolved_command_set(evolved_dir):
+    return {p.name for p in (evolved_dir / "commands").glob("*.md")}
+
+
+def test_generate_evolved_is_idempotent(tmp_path):
+    """A second `--generate` run must produce zero new files."""
+    evolved_dir = tmp_path / "evolved"
+    workflow_instincts = [
+        {"id": "csv-before-spreadsheet", "trigger": "when creating a tracking sheet",
+         "confidence": 0.8, "domain": "workflow", "content": "## Action\nGenerate CSV first."},
+        {"id": "heavy-bash-session-antipattern", "trigger": "when a session has many bash calls",
+         "confidence": 0.7, "domain": "workflow", "content": "## Action\nBatch the commands."},
+    ]
+
+    first = _generate_evolved([], workflow_instincts, [], evolved_dir)
+    after_first = _evolved_command_set(evolved_dir)
+    assert len(first) == 2
+    assert len(after_first) == 2
+
+    second = _generate_evolved([], workflow_instincts, [], evolved_dir)
+    after_second = _evolved_command_set(evolved_dir)
+    assert second == []                      # nothing new generated
+    assert after_second == after_first       # no new files on disk
+
+
+def test_generate_evolved_skips_human_renamed_file(tmp_path):
+    """An instinct already covered by a curated (renamed) file is not re-emitted."""
+    evolved_dir = tmp_path / "evolved"
+    (evolved_dir / "commands").mkdir(parents=True)
+    # Curated file with a clean name + frontmatter pointing at the instinct.
+    (evolved_dir / "commands" / "csv-tracker.md").write_text(
+        "---\nsource_instinct: csv-before-spreadsheet\nconfidence: 0.80\n"
+        "domain: workflow\n---\n\n# /csv-tracker\n\nGenerate the CSV first.\n"
+    )
+
+    workflow_instincts = [
+        {"id": "csv-before-spreadsheet", "trigger": "when creating a tracking sheet",
+         "confidence": 0.8, "domain": "workflow", "content": "## Action\nGenerate CSV first."},
+    ]
+    generated = _generate_evolved([], workflow_instincts, [], evolved_dir)
+
+    assert generated == []  # already covered by the renamed file
+    names = _evolved_command_set(evolved_dir)
+    assert names == {"csv-tracker.md"}  # no ugly auto-slug duplicate created
+
+
+def test_generate_evolved_names_command_by_instinct_id(tmp_path):
+    """Net-new command files are named from the instinct id, not the trigger."""
+    evolved_dir = tmp_path / "evolved"
+    workflow_instincts = [
+        {"id": "judge-fixes-by-risk-not-session-length",
+         "trigger": "when a review flags a fixable issue and the session is long",
+         "confidence": 0.7, "domain": "workflow", "content": "## Action\nJudge by risk."},
+    ]
+    _generate_evolved([], workflow_instincts, [], evolved_dir)
+    assert _evolved_command_set(evolved_dir) == {"judge-fixes-by-risk-not-session-length.md"}
+
+
+def test_evolved_instinct_ids_reads_all_markers(tmp_path):
+    """The dedup scan recognizes all three source-instinct marker styles."""
+    evolved_dir = tmp_path / "evolved"
+    cmds = evolved_dir / "commands"
+    cmds.mkdir(parents=True)
+    (cmds / "a.md").write_text("---\nsource_instinct: alpha\n---\nbody\n")
+    (cmds / "b.md").write_text("# /b\n\nEvolved from instinct: beta\nbody\n")
+    (cmds / "c.md").write_text("# /c\n\n<!-- evolved-from: gamma,delta -->\nbody\n")
+
+    ids = _evolved_instinct_ids(evolved_dir)
+    assert {"alpha", "beta", "gamma", "delta"}.issubset(ids)

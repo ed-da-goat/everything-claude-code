@@ -13,7 +13,8 @@
 set -e
 
 # Hook phase from CLI argument: "pre" (PreToolUse) or "post" (PostToolUse)
-HOOK_PHASE="${1:-post}"
+# Falls back to auto-detection from JSON content if not passed.
+HOOK_PHASE="${1:-auto}"
 
 # ─────────────────────────────────────────────
 # Read stdin first (before project detection)
@@ -25,6 +26,30 @@ INPUT_JSON=$(cat)
 # Exit if no input
 if [ -z "$INPUT_JSON" ]; then
   exit 0
+fi
+
+# ─────────────────────────────────────────────
+# Smart capture: skip noisy PreToolUse events
+# ─────────────────────────────────────────────
+# Detect phase from JSON (no Python needed): PostToolUse has "tool_response".
+# For PreToolUse, only capture high-signal tools (Edit, Write, Agent).
+# This eliminates ~80% of PreToolUse Python spawns.
+
+_HAS_RESPONSE=$(echo "$INPUT_JSON" | grep -c '"tool_response"' || true)
+if [ "$_HAS_RESPONSE" -eq 0 ]; then
+  # This is a PreToolUse event
+  if [ "$HOOK_PHASE" = "auto" ]; then
+    HOOK_PHASE="pre"
+  fi
+  _tool_name=$(echo "$INPUT_JSON" | grep -o '"tool_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"tool_name"[[:space:]]*:[[:space:]]*"//;s/".*//')
+  case "$_tool_name" in
+    Edit|Write|MultiEdit|Agent) ;; # High-signal: proceed with capture
+    *) exit 0 ;; # Low-signal PreToolUse: skip entirely
+  esac
+else
+  if [ "$HOOK_PHASE" = "auto" ]; then
+    HOOK_PHASE="post"
+  fi
 fi
 
 resolve_python_cmd() {
@@ -96,12 +121,13 @@ fi
 #   - ECC observing other tools' automated sessions
 #   - automated sessions creating project-scoped homunculus metadata
 
-# Layer 1: entrypoint. Only interactive terminal sessions should continue.
+# Layer 1: entrypoint. Only interactive human sessions should continue.
 # sdk-ts: Agent SDK sessions can be human-interactive (e.g. via Happy).
+# claude-desktop / vscode / jetbrains: interactive GUI/IDE clients.
 # Non-interactive SDK automation is still filtered by Layers 2-5 below
 # (ECC_HOOK_PROFILE=minimal, ECC_SKIP_OBSERVE=1, agent_id, path exclusions).
 case "${CLAUDE_CODE_ENTRYPOINT:-cli}" in
-  cli|sdk-ts) ;;
+  cli|sdk-ts|claude-desktop|vscode|jetbrains) ;;
   *) exit 0 ;;
 esac
 
@@ -163,11 +189,14 @@ import os
 try:
     data = json.load(sys.stdin)
 
-    # Determine event type from CLI argument passed via env var.
-    # Claude Code does NOT include a "hook_type" field in the stdin JSON,
-    # so we rely on the shell argument ("pre" or "post") instead.
-    hook_phase = os.environ.get("HOOK_PHASE", "post")
-    event = "tool_start" if hook_phase == "pre" else "tool_complete"
+    # Determine event type: prefer JSON-based detection (tool_response present
+    # = PostToolUse), fall back to CLI argument passed via env var.
+    has_response = "tool_response" in data or "tool_output" in data
+    hook_phase = os.environ.get("HOOK_PHASE", "auto")
+    if hook_phase == "auto":
+        event = "tool_complete" if has_response else "tool_start"
+    else:
+        event = "tool_start" if hook_phase == "pre" else "tool_complete"
 
     # Extract fields - Claude Code hook format
     tool_name = data.get("tool_name", data.get("tool", "unknown"))
@@ -194,7 +223,7 @@ try:
         "parsed": True,
         "event": event,
         "tool": tool_name,
-        "input": tool_input_str if event == "tool_start" else None,
+        "input": tool_input_str,
         "output": tool_response_str if event == "tool_complete" else None,
         "session": session_id,
         "tool_use_id": tool_use_id,
@@ -273,7 +302,7 @@ def scrub(val):
         return None
     return _SECRET_RE.sub(lambda m: m.group(1) + m.group(2) + (m.group(3) or "") + "[REDACTED]", str(val))
 
-if parsed["input"]:
+if parsed.get("input"):
     observation["input"] = scrub(parsed["input"])
 if parsed["output"] is not None:
     observation["output"] = scrub(parsed["output"])
@@ -338,32 +367,17 @@ if [ "$OBSERVER_ENABLED" = "true" ]; then
 
   # Check if observer is now running after cleanup
   if [ ! -f "${PROJECT_DIR}/.observer.pid" ] && [ ! -f "${CONFIG_DIR}/.observer.pid" ]; then
-    # Use flock if available (Linux), fallback for macOS
-    if command -v flock >/dev/null 2>&1; then
-      (
-        flock -n 9 || exit 0
-        # Double-check PID files after acquiring lock
-        _CHECK_OBSERVER_RUNNING "${PROJECT_DIR}/.observer.pid" || true
-        _CHECK_OBSERVER_RUNNING "${CONFIG_DIR}/.observer.pid" || true
-        if [ ! -f "${PROJECT_DIR}/.observer.pid" ] && [ ! -f "${CONFIG_DIR}/.observer.pid" ]; then
-          nohup "${SKILL_ROOT}/agents/start-observer.sh" start >/dev/null 2>&1 &
-        fi
-      ) 9>"$LAZY_START_LOCK"
-    else
-      # macOS fallback: use lockfile if available, otherwise skip
-      if command -v lockfile >/dev/null 2>&1; then
-        # Use subshell to isolate exit and add trap for cleanup
-        (
-          trap 'rm -f "$LAZY_START_LOCK" 2>/dev/null || true' EXIT
-          lockfile -r 1 -l 30 "$LAZY_START_LOCK" 2>/dev/null || exit 0
-          _CHECK_OBSERVER_RUNNING "${PROJECT_DIR}/.observer.pid" || true
-          _CHECK_OBSERVER_RUNNING "${CONFIG_DIR}/.observer.pid" || true
-          if [ ! -f "${PROJECT_DIR}/.observer.pid" ] && [ ! -f "${CONFIG_DIR}/.observer.pid" ]; then
-            nohup "${SKILL_ROOT}/agents/start-observer.sh" start >/dev/null 2>&1 &
-          fi
-          rm -f "$LAZY_START_LOCK" 2>/dev/null || true
-        )
+    # Atomic lock using mkdir (works on macOS, Linux, and all POSIX systems)
+    if mkdir "$LAZY_START_LOCK" 2>/dev/null; then
+      trap 'rm -rf "$LAZY_START_LOCK" 2>/dev/null' EXIT
+      # Double-check PID files after acquiring lock
+      _CHECK_OBSERVER_RUNNING "${PROJECT_DIR}/.observer.pid" || true
+      _CHECK_OBSERVER_RUNNING "${CONFIG_DIR}/.observer.pid" || true
+      if [ ! -f "${PROJECT_DIR}/.observer.pid" ] && [ ! -f "${CONFIG_DIR}/.observer.pid" ]; then
+        nohup "${SKILL_ROOT}/agents/start-observer.sh" start >/dev/null 2>&1 &
       fi
+      rm -rf "$LAZY_START_LOCK" 2>/dev/null || true
+      trap - EXIT
     fi
   fi
 fi
